@@ -1,0 +1,12 @@
+[package]
+name = "bmi-burn-lstm"
+version = "0.1.0"
+edition = "2024"
+
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+bmi-rs = { path = "../bmi-rs/bmi-rs/" }
+ffi = { path = "../bmi-rs/bmi-rs-sys/", package = "bmi-rs-sys", version = "0.0.1" }
