@@ -8,5 +8,12 @@ edition = "2024"
 crate-type = ["cdylib"]
 
 [dependencies]
+anyhow = "1.0.100"
 bmi-rs = { path = "../bmi-rs/bmi-rs/" }
+burn = { version = "0.18.0", features = ["candle", "ndarray"] }
+burn-import = "0.18.0"
 ffi = { path = "../bmi-rs/bmi-rs-sys/", package = "bmi-rs-sys", version = "0.0.1" }
+glob = "0.3.3"
+serde = { version = "1.0.226", features = ["derive"] }
+serde_json = "1.0.145"
+serde_yaml = "0.9.34"
