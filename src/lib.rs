@@ -6,8 +6,11 @@ use burn_import::pytorch::PyTorchFileRecorder;
 use glob::glob;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::Path;
+use std::thread;
+use std::time::Duration;
 
 mod nextgen_lstm;
 mod python;
@@ -31,6 +34,14 @@ struct TrainingScalars {
     output_std: f32,
 }
 
+// Structure to hold a single model's components
+struct ModelInstance<B: Backend> {
+    model: NextgenLstm<B>,
+    metadata: ModelMetadata,
+    scalars: TrainingScalars,
+    lstm_state: Option<LstmState<B, 2>>,
+}
+
 // Macro to handle variable lookup
 macro_rules! match_var {
     ($name:expr, $($pattern:pat => $result:expr),+ $(,)?) => {
@@ -45,12 +56,9 @@ macro_rules! match_var {
 }
 
 pub struct LstmBmi<B: Backend> {
-    // Model components
-    model: Option<NextgenLstm<B>>,
+    // Ensemble of models
+    models: Vec<ModelInstance<B>>,
     device: B::Device,
-    metadata: Option<ModelMetadata>,
-    scalars: Option<TrainingScalars>,
-    lstm_state: Option<LstmState<B, 2>>,
 
     // Configuration
     config_path: String,
@@ -106,11 +114,8 @@ impl<B: Backend> LstmBmi<B> {
         }
 
         LstmBmi {
-            model: None,
+            models: Vec::new(),
             device,
-            metadata: None,
-            scalars: None,
-            lstm_state: None,
             config_path: String::new(),
             area_sqkm: 0.0,
             output_scale_factor_cms: 0.0,
@@ -163,94 +168,7 @@ impl<B: Backend> LstmBmi<B> {
             .unwrap_or_else(|| internal.to_string())
     }
 
-    fn run_model(&mut self) -> BmiResult<()> {
-        let model = self.model.as_ref().ok_or("Model not initialized")?;
-        let metadata = self.metadata.as_ref().ok_or("Metadata not loaded")?;
-        let scalars = self.scalars.as_ref().ok_or("Scalars not loaded")?;
-
-        // Gather inputs in the correct order
-        let mut inputs = Vec::new();
-        for name in &metadata.input_names {
-            let bmi_name = self.internal_to_external_name(name);
-            let value = self
-                .variables
-                .get(&bmi_name)
-                .and_then(|v| v.first())
-                .copied()
-                .unwrap_or(0.0) as f32;
-            inputs.push(value);
-        }
-
-        // dbg!(&inputs);
-
-        // Scale inputs
-        let scaled_inputs: Vec<f32> = inputs
-            .iter()
-            .zip(&scalars.input_mean)
-            .zip(&scalars.input_std)
-            .map(
-                |((val, mean), std)| {
-                    if *std != 0.0 { (val - mean) / std } else { 0.0 }
-                },
-            )
-            .collect();
-
-        // dbg!(&scaled_inputs);
-
-        // Create input tensor
-        let input_tensor_data = vec_to_tensor(&scaled_inputs, vec![1, 1, metadata.input_size]);
-        let input_tensor = Tensor::from_data(input_tensor_data, &self.device);
-
-        // Forward pass
-        let (output, new_state) = model.forward(input_tensor, self.lstm_state.take());
-        // dbg!(&new_state.hidden);
-        // dbg!(&new_state.cell);
-        self.lstm_state = Some(new_state);
-
-        // Process output
-        let output_vec: Vec<f32> = output.into_data().to_vec().unwrap();
-        let output_value = output_vec[0];
-
-        // Denormalize
-        let surface_runoff_mm = (output_value * scalars.output_std + scalars.output_mean).max(0.0);
-
-        // Convert to output units
-        let surface_runoff_m = surface_runoff_mm / 1000.0;
-        let surface_runoff_volume_m3_s = surface_runoff_mm * self.output_scale_factor_cms;
-
-        // Set outputs
-        self.variables.insert(
-            "land_surface_water__runoff_depth".to_string(),
-            vec![surface_runoff_m as f64],
-        );
-        self.variables.insert(
-            "land_surface_water__runoff_volume_flux".to_string(),
-            vec![surface_runoff_volume_m3_s as f64],
-        );
-
-        Ok(())
-    }
-}
-
-impl<B: Backend> Bmi for LstmBmi<B> {
-    fn initialize(&mut self, config_file: &str) -> BmiResult<()> {
-        println!("Initializing LSTM BMI with config: {}", config_file);
-        self.config_path = config_file.to_string();
-
-        // Load configuration
-        let config_path = Path::new(config_file);
-        let config_str = fs::read_to_string(config_path)?;
-        let config: serde_yaml::Value = serde_yaml::from_str(&config_str)?;
-
-        // Get training config path
-        let training_config_path = Path::new(
-            config["train_cfg_file"]
-                .get(0)
-                .ok_or("Missing train_cfg_file")?
-                .as_str()
-                .ok_or("train_cfg_file not a string")?,
-        );
-
+    fn load_single_model(&self, training_config_path: &Path) -> BmiResult<ModelInstance<B>> {
         let training_config = fs::read_to_string(training_config_path)?;
         let training_config: serde_yaml::Value = serde_yaml::from_str(&training_config)?;
 
@@ -277,26 +195,102 @@ impl<B: Backend> Bmi for LstmBmi<B> {
 
         // Convert weights if needed
         let model_folder = model_path.parent().unwrap();
-        let converted_path = model_folder
-            .join("burn")
-            .join(model_path.file_name().unwrap());
+        let burn_dir = model_folder.join("burn");
+        let converted_path = burn_dir.join(model_path.file_name().unwrap());
+        let lock_file_path = burn_dir.join(".conversion.lock");
 
-        // if !converted_path.exists() {
-        println!("Converting PyTorch weights to Burn format...");
-        convert_model(&model_path, &training_config_path)?;
-        // }
+        // Create burn directory if it doesn't exist
+        if !burn_dir.exists() {
+            fs::create_dir_all(&burn_dir)?;
+        }
+
+        // Check if conversion is needed
+        let needs_conversion = !converted_path.exists()
+            || !converted_path.with_extension("json").exists()
+            || !burn_dir.join("train_data_scaler.json").exists()
+            || !burn_dir.join("weights.json").exists();
+
+        if needs_conversion {
+            // Try to acquire lock
+            let mut lock_acquired = false;
+            let process_id = std::process::id();
+
+            loop {
+                // Try to create lock file atomically
+                match fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&lock_file_path)
+                {
+                    Ok(mut file) => {
+                        // Write process ID to lock file for debugging
+                        use std::io::Write;
+                        writeln!(file, "Locked by process {}", process_id)?;
+                        lock_acquired = true;
+                        println!("Process {} acquired conversion lock", process_id);
+                        break;
+                    }
+                    Err(_) => {
+                        // Lock file exists, another process is converting
+                        println!(
+                            "Process {} waiting for model conversion (lock held by another process)...",
+                            process_id
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(1000));
+
+                        // Check if conversion is complete
+                        if converted_path.exists()
+                            && converted_path.with_extension("json").exists()
+                            && burn_dir.join("train_data_scaler.json").exists()
+                            && burn_dir.join("weights.json").exists()
+                        {
+                            println!("Process {} found completed conversion", process_id);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // If we acquired the lock, do the conversion
+            if lock_acquired {
+                println!(
+                    "Process {} converting PyTorch weights to Burn format for model: {}",
+                    process_id,
+                    model_path.display()
+                );
+
+                // Perform conversion
+                match convert_model(&model_path, &training_config_path) {
+                    Ok(_) => {
+                        println!("Process {} completed model conversion", process_id);
+                    }
+                    Err(e) => {
+                        // Clean up lock file on error
+                        let _ = fs::remove_file(&lock_file_path);
+                        return Err(Box::new(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("Model conversion failed: {}", e),
+                        )));
+                    }
+                }
+
+                // Remove lock file after successful conversion
+                fs::remove_file(&lock_file_path)?;
+                println!("Process {} released conversion lock", process_id);
+            }
+        } else {
+            println!("Model already converted, skipping conversion");
+        }
 
         // Load metadata
         let metadata_str = fs::read_to_string(converted_path.with_extension("json"))?;
-        self.metadata = Some(serde_json::from_str(&metadata_str)?);
+        let metadata: ModelMetadata = serde_json::from_str(&metadata_str)?;
 
         // Load scalars
-        let scalars_str =
-            fs::read_to_string(model_folder.join("burn").join("train_data_scaler.json"))?;
-        self.scalars = Some(serde_json::from_str(&scalars_str)?);
+        let scalars_str = fs::read_to_string(burn_dir.join("train_data_scaler.json"))?;
+        let scalars: TrainingScalars = serde_json::from_str(&scalars_str)?;
 
         // Load model
-        let metadata = self.metadata.as_ref().unwrap();
         let record = PyTorchFileRecorder::<FullPrecisionSettings>::default()
             .load(converted_path.into(), &self.device)?;
 
@@ -309,14 +303,144 @@ impl<B: Backend> Bmi for LstmBmi<B> {
         model = model.load_record(record);
         model.load_json_weights(
             &self.device,
-            model_folder
-                .join("burn")
-                .join("weights.json")
-                .to_str()
-                .unwrap(),
+            burn_dir.join("weights.json").to_str().unwrap(),
         );
 
-        self.model = Some(model);
+        Ok(ModelInstance {
+            model,
+            metadata,
+            scalars,
+            lstm_state: None,
+        })
+    }
+
+    fn run_single_model(&mut self, model_idx: usize, inputs: &[f32]) -> BmiResult<f32> {
+        let model_instance = &mut self.models[model_idx];
+
+        // Scale inputs
+        let scaled_inputs: Vec<f32> = inputs
+            .iter()
+            .zip(&model_instance.scalars.input_mean)
+            .zip(&model_instance.scalars.input_std)
+            .map(
+                |((val, mean), std)| {
+                    if *std != 0.0 { (val - mean) / std } else { 0.0 }
+                },
+            )
+            .collect();
+
+        // Create input tensor
+        let input_tensor_data = vec_to_tensor(
+            &scaled_inputs,
+            vec![1, 1, model_instance.metadata.input_size],
+        );
+        let input_tensor = Tensor::from_data(input_tensor_data, &self.device);
+
+        // Forward pass
+        let (output, new_state) = model_instance
+            .model
+            .forward(input_tensor, model_instance.lstm_state.take());
+        model_instance.lstm_state = Some(new_state);
+
+        // Process output
+        let output_vec: Vec<f32> = output.into_data().to_vec().unwrap();
+        let output_value = output_vec[0];
+
+        // Denormalize
+        let surface_runoff_mm = (output_value * model_instance.scalars.output_std
+            + model_instance.scalars.output_mean)
+            .max(0.0);
+
+        Ok(surface_runoff_mm)
+    }
+
+    fn run_ensemble(&mut self) -> BmiResult<()> {
+        if self.models.is_empty() {
+            return Err("No models in ensemble")?;
+        }
+
+        // Use the first model's metadata for input names (assuming all models have same structure)
+        let input_names = self.models[0].metadata.input_names.clone();
+
+        // Gather inputs in the correct order
+        let mut inputs = Vec::new();
+        for name in &input_names {
+            let bmi_name = self.internal_to_external_name(name);
+            let value = self
+                .variables
+                .get(&bmi_name)
+                .and_then(|v| v.first())
+                .copied()
+                .unwrap_or(0.0) as f32;
+            inputs.push(value);
+        }
+
+        // Run all models and collect outputs
+        let mut ensemble_outputs = Vec::new();
+        for i in 0..self.models.len() {
+            let output = self.run_single_model(i, &inputs)?;
+            ensemble_outputs.push(output);
+        }
+
+        // Calculate mean of ensemble outputs
+        let mean_surface_runoff_mm = if !ensemble_outputs.is_empty() {
+            ensemble_outputs.iter().sum::<f32>() / ensemble_outputs.len() as f32
+        } else {
+            0.0
+        };
+
+        // Convert to output units
+        let surface_runoff_m = mean_surface_runoff_mm / 1000.0;
+        let surface_runoff_volume_m3_s = mean_surface_runoff_mm * self.output_scale_factor_cms;
+
+        // Set outputs
+        self.variables.insert(
+            "land_surface_water__runoff_depth".to_string(),
+            vec![surface_runoff_m as f64],
+        );
+        self.variables.insert(
+            "land_surface_water__runoff_volume_flux".to_string(),
+            vec![surface_runoff_volume_m3_s as f64],
+        );
+        Ok(())
+    }
+}
+
+impl<B: Backend> Bmi for LstmBmi<B> {
+    fn initialize(&mut self, config_file: &str) -> BmiResult<()> {
+        println!("Initializing LSTM BMI with config: {}", config_file);
+        self.config_path = config_file.to_string();
+
+        // Load configuration
+        let config_path = Path::new(config_file);
+        let config_str = fs::read_to_string(config_path)?;
+        let config: serde_yaml::Value = serde_yaml::from_str(&config_str)?;
+
+        // Get all training config paths (ensemble)
+        let training_configs = config["train_cfg_file"]
+            .as_sequence()
+            .ok_or("train_cfg_file should be an array")?;
+
+        println!("Loading ensemble of {} models", training_configs.len());
+
+        // Load each model in the ensemble
+        for (idx, config_value) in training_configs.iter().enumerate() {
+            let training_config_path = Path::new(
+                config_value
+                    .as_str()
+                    .ok_or(format!("train_cfg_file[{}] not a string", idx))?,
+            );
+
+            println!(
+                "Loading model {}/{}: {}",
+                idx + 1,
+                training_configs.len(),
+                training_config_path.display()
+            );
+
+            let model_instance = self.load_single_model(training_config_path)?;
+            self.models.push(model_instance);
+        }
 
         // Get area from config
         self.area_sqkm = config
@@ -346,12 +470,15 @@ impl<B: Backend> Bmi for LstmBmi<B> {
         // Reset time
         self.current_time = self.start_time;
 
-        println!("LSTM BMI initialized successfully");
+        println!(
+            "LSTM BMI ensemble initialized successfully with {} models",
+            self.models.len()
+        );
         Ok(())
     }
 
     fn update(&mut self) -> BmiResult<()> {
-        self.run_model()?;
+        self.run_ensemble()?;
         self.current_time += self.time_step;
         Ok(())
     }
@@ -377,14 +504,12 @@ impl<B: Backend> Bmi for LstmBmi<B> {
     }
 
     fn finalize(&mut self) -> BmiResult<()> {
-        println!("Finalizing LSTM BMI");
-        self.model = None;
-        self.lstm_state = None;
+        self.models.clear();
         Ok(())
     }
 
     fn get_component_name(&self) -> &str {
-        "NextGen LSTM BMI"
+        "NextGen LSTM BMI Ensemble"
     }
 
     fn get_input_item_count(&self) -> u32 {
