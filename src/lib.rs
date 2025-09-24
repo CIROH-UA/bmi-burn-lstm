@@ -358,26 +358,22 @@ impl<B: Backend> LstmBmi<B> {
         if self.models.is_empty() {
             return Err("No models in ensemble")?;
         }
-
-        // Use the first model's metadata for input names (assuming all models have same structure)
-        let input_names = self.models[0].metadata.input_names.clone();
-
-        // Gather inputs in the correct order
-        let mut inputs = Vec::new();
-        for name in &input_names {
-            let bmi_name = self.internal_to_external_name(name);
-            let value = self
-                .variables
-                .get(&bmi_name)
-                .and_then(|v| v.first())
-                .copied()
-                .unwrap_or(0.0) as f32;
-            inputs.push(value);
-        }
-
         // Run all models and collect outputs
         let mut ensemble_outputs = Vec::new();
         for i in 0..self.models.len() {
+            let input_names = self.models[i].metadata.input_names.clone();
+            // Gather inputs in the correct order
+            let mut inputs = Vec::new();
+            for name in &input_names {
+                let bmi_name = self.internal_to_external_name(name);
+                let value = self
+                    .variables
+                    .get(&bmi_name)
+                    .and_then(|v| v.first())
+                    .copied()
+                    .unwrap_or(0.0) as f32;
+                inputs.push(value);
+            }
             let output = self.run_single_model(i, &inputs)?;
             ensemble_outputs.push(output);
         }
