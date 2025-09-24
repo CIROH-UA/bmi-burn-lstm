@@ -9,7 +9,6 @@ use burn::{
 };
 use serde_json::Value;
 use std::fs;
-use std::path::Path;
 /// Simple LSTM matching the PyTorch Nextgen_CudaLSTM architecture
 #[derive(Module, Debug)]
 pub struct NextgenLstm<B: Backend> {

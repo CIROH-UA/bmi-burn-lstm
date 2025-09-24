@@ -6,11 +6,9 @@ use burn_import::pytorch::PyTorchFileRecorder;
 use glob::glob;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs;
+
 use std::path::Path;
-use std::thread;
-use std::time::Duration;
 
 mod nextgen_lstm;
 mod python;
@@ -227,15 +225,15 @@ impl<B: Backend> LstmBmi<B> {
                         use std::io::Write;
                         writeln!(file, "Locked by process {}", process_id)?;
                         lock_acquired = true;
-                        println!("Process {} acquired conversion lock", process_id);
+                        // println!("Process {} acquired conversion lock", process_id);
                         break;
                     }
                     Err(_) => {
                         // Lock file exists, another process is converting
-                        println!(
-                            "Process {} waiting for model conversion (lock held by another process)...",
-                            process_id
-                        );
+                        // println!(
+                        //     "Process {} waiting for model conversion (lock held by another process)...",
+                        //     process_id
+                        // );
                         std::thread::sleep(std::time::Duration::from_millis(1000));
 
                         // Check if conversion is complete
@@ -244,7 +242,7 @@ impl<B: Backend> LstmBmi<B> {
                             && burn_dir.join("train_data_scaler.json").exists()
                             && burn_dir.join("weights.json").exists()
                         {
-                            println!("Process {} found completed conversion", process_id);
+                            // println!("Process {} found completed conversion", process_id);
                             break;
                         }
                     }
@@ -279,7 +277,7 @@ impl<B: Backend> LstmBmi<B> {
                 println!("Process {} released conversion lock", process_id);
             }
         } else {
-            println!("Model already converted, skipping conversion");
+            // println!("Model already converted, skipping conversion");
         }
 
         // Load metadata
@@ -404,7 +402,7 @@ impl<B: Backend> LstmBmi<B> {
 
 impl<B: Backend> Bmi for LstmBmi<B> {
     fn initialize(&mut self, config_file: &str) -> BmiResult<()> {
-        println!("Initializing LSTM BMI with config: {}", config_file);
+        // println!("Initializing LSTM BMI with config: {}", config_file);
         self.config_path = config_file.to_string();
 
         // Load configuration
@@ -417,7 +415,7 @@ impl<B: Backend> Bmi for LstmBmi<B> {
             .as_sequence()
             .ok_or("train_cfg_file should be an array")?;
 
-        println!("Loading ensemble of {} models", training_configs.len());
+        // println!("Loading ensemble of {} models", training_configs.len());
 
         // Load each model in the ensemble
         for (idx, config_value) in training_configs.iter().enumerate() {
@@ -427,12 +425,12 @@ impl<B: Backend> Bmi for LstmBmi<B> {
                     .ok_or(format!("train_cfg_file[{}] not a string", idx))?,
             );
 
-            println!(
-                "Loading model {}/{}: {}",
-                idx + 1,
-                training_configs.len(),
-                training_config_path.display()
-            );
+            // println!(
+            //     "Loading model {}/{}: {}",
+            //     idx + 1,
+            //     training_configs.len(),
+            //     training_config_path.display()
+            // );
 
             let model_instance = self.load_single_model(training_config_path)?;
             self.models.push(model_instance);
@@ -466,10 +464,10 @@ impl<B: Backend> Bmi for LstmBmi<B> {
         // Reset time
         self.current_time = self.start_time;
 
-        println!(
-            "LSTM BMI ensemble initialized successfully with {} models",
-            self.models.len()
-        );
+        // println!(
+        //     "LSTM BMI ensemble initialized successfully with {} models",
+        //     self.models.len()
+        // );
         Ok(())
     }
 
@@ -517,12 +515,10 @@ impl<B: Backend> Bmi for LstmBmi<B> {
     }
 
     fn get_input_var_names(&self) -> &[&str] {
-        println!("Getting input variable names");
         &self.input_var_names
     }
 
     fn get_output_var_names(&self) -> &[&str] {
-        println!("Getting output variable names");
         &self.output_var_names
     }
 

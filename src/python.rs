@@ -261,9 +261,9 @@ if __name__ == "__main__":
 
     let script_path = std::env::temp_dir().join("convert_weights.py");
     fs::write(&script_path, script)?;
-    dbg!(&weights_path);
-    dbg!(&config_path);
-    dbg!(&script_path);
+    // dbg!(&weights_path);
+    // dbg!(&config_path);
+    // dbg!(&script_path);
     let output = Command::new("uv")
         .arg("run")
         .arg("-p")
