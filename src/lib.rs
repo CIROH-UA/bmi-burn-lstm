@@ -592,19 +592,6 @@ impl<B: Backend> Bmi for LstmBmi<B> {
         self.time_step
     }
 
-    fn get_value(&self, name: &str) -> BmiResult<Values> {
-        Ok(self
-            .variables
-            .get(name)
-            .map(|v| Values::F64(v.clone()))
-            .ok_or_else(|| {
-                Box::new(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!("Variable {} not found", name),
-                ))
-            })?)
-    }
-
     fn get_value_ptr(&self, name: &str) -> BmiResult<RefValues<'_>> {
         Ok(self
             .variables
