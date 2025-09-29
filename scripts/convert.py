@@ -240,11 +240,20 @@ def export_training_scalars(cfg_path: Path, output_path: Path = None):
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        print("Usage: python convert_weights.py input.pt model_config.yml")
+        print("Usage: python convert.py input.pt model_config.yml")
+        print("Usage: python convert.py all /path/to/trained_models/")
         sys.exit(1)
 
-    model_path = sys.argv[1]
-    config_path = sys.argv[2]
-    hidden_size = export_training_scalars(config_path)
-
-    convert_pytorch_to_burn(model_path, hidden_size, config_path)
+    if sys.argv[1] == "all":
+        model_directories = Path(sys.argv[2]).glob("*")
+        for dir in model_directories:
+            model_path = next(dir.glob("model_epoch*.pt"))
+            config_path = dir / "config.yml"
+            if model_path.exists() and config_path.exists():
+                hidden_size = export_training_scalars(config_path)
+                convert_pytorch_to_burn(model_path, hidden_size, config_path)
+    else:
+        model_path = sys.argv[1]
+        config_path = sys.argv[2]
+        hidden_size = export_training_scalars(config_path)
+        convert_pytorch_to_burn(model_path, hidden_size, config_path)
